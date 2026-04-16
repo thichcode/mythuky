@@ -83,6 +83,9 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
     action_type = "rollback" if should_rollback else "observe"
     requires_approval = payload.env == "prod" and action_type == "rollback"
 
+    action_type = "rollback" if should_rollback else "observe"
+
+    requires_approval = payload.env == "prod" and action_type == "rollback"
     repo.log_policy_decision(
         request_id=request_id,
         action_type=action_type,
@@ -107,6 +110,7 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
                 "env": payload.env,
                 "llm": llm_info,
             },
+            metadata={"session_id": session_id, "env": payload.env},
         )
         if not requires_approval:
             action = run_action_executor(action)
@@ -121,6 +125,8 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
         },
         "recommendation": recommendation,
         "llm": llm_info,
+        "metrics": {"error_rate": error_rate, "redis_latency_ms_estimate": redis_latency},
+        "recommendation": recommendation,
         "proposed_action": action_type,
         "approval_required": requires_approval,
         "action_status": action["status"] if action else "none",
