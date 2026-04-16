@@ -42,6 +42,7 @@ class IncidentMessage(BaseModel):
     text: str
     service: str
     env: str
+    external_event_id: str | None = None
 
 
 class ApprovalRequest(BaseModel):

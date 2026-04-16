@@ -133,11 +133,17 @@ curl -s http://localhost:8000/approvals/<request_id> \
   }' | jq
 ```
 
+## Migrations
+
+- SQL migrations are applied on startup from `db/migrations/*.sql` and tracked in `schema_migration`.
+
 ## Tests
 
 ```bash
 pytest -q
 ```
+
+Integration-like API tests are in `tests/test_api_integration.py` (webhook -> approval flow and webhook dedupe).
 
 ## Notes
 

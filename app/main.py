@@ -51,6 +51,29 @@ def run_action_executor(action_row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
+    if payload.external_event_id:
+        existing_request_id = repo.get_request_id_by_external_event(payload.external_event_id)
+        if existing_request_id:
+            existing_action = repo.get_action_by_request(existing_request_id)
+            logger.info(
+                "incident_duplicate_event",
+                extra={
+                    "external_event_id": payload.external_event_id,
+                    "request_id": existing_request_id,
+                },
+            )
+            return {
+                "request_id": existing_request_id,
+                "duplicate": True,
+                "action_status": existing_action["status"] if existing_action else "none",
+            }
+
+    request_id = str(uuid.uuid4())
+    session_id = repo.ensure_session(payload.thread_id, payload.channel)
+
+    if payload.external_event_id:
+        repo.register_webhook_event(payload.external_event_id, payload.channel, payload.thread_id, request_id)
+
     request_id = str(uuid.uuid4())
     session_id = repo.ensure_session(payload.thread_id, payload.channel)
 
@@ -179,6 +202,7 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
 
 @app.on_event("startup")
 def startup() -> None:
+    repo.apply_migrations()
     repo.init_schema()
 
 
@@ -220,6 +244,9 @@ def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any
     )
 
     if decision == "reject":
+        action = repo.transition_action_status(action["idempotency_key"], "rejected")
+        logger.info("approval_rejected", extra={"request_id": request_id})
+        return {"request_id": request_id, "status": action["status"] if action else "rejected"}
         repo.upsert_action(
             request_id=action["request_id"],
             action_type=action["action_type"],
@@ -239,6 +266,11 @@ def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any
             action_type=action["action_type"],
             target=action["target"],
             idempotency_key=action["idempotency_key"],
+            status=action["status"],
+            metadata=merged_meta,
+        )
+
+    repo.transition_action_status(action["idempotency_key"], "approved")
             status="approved",
             metadata=merged_meta,
         )

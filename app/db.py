@@ -8,6 +8,17 @@ import psycopg
 from psycopg.rows import dict_row
 
 
+VALID_ACTION_STATUSES = {"pending_approval", "approved", "executed", "rejected", "failed"}
+
+ALLOWED_TRANSITIONS = {
+    "pending_approval": {"approved", "rejected", "failed", "executed"},
+    "approved": {"executed", "failed"},
+    "executed": set(),
+    "rejected": set(),
+    "failed": set(),
+}
+
+
 class PostgresRepository:
     def __init__(self, database_url: str) -> None:
         self.database_url = database_url
@@ -15,6 +26,30 @@ class PostgresRepository:
     def _connect(self):
         return psycopg.connect(self.database_url, row_factory=dict_row)
 
+    def apply_migrations(self) -> None:
+        migration_dir = Path(__file__).resolve().parent.parent / "db" / "migrations"
+        migration_files = sorted(migration_dir.glob("*.sql"))
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    create table if not exists schema_migration (
+                      version text primary key,
+                      applied_at timestamptz not null default now()
+                    )
+                    """
+                )
+                for file in migration_files:
+                    version = file.name
+                    cur.execute("select 1 from schema_migration where version = %s", (version,))
+                    exists = cur.fetchone()
+                    if exists:
+                        continue
+
+                    sql = file.read_text(encoding="utf-8")
+                    cur.execute(sql)
+                    cur.execute("insert into schema_migration (version) values (%s)", (version,))
     def init_schema(self) -> None:
         schema_path = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
         sql = schema_path.read_text(encoding="utf-8")
@@ -37,6 +72,41 @@ class PostgresRepository:
                 row = cur.fetchone()
             conn.commit()
         return int(row["id"])
+
+    def register_webhook_event(
+        self,
+        external_event_id: str,
+        channel: str,
+        thread_id: str,
+        request_id: str,
+    ) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into webhook_event (external_event_id, channel, thread_id, request_id)
+                    values (%s, %s, %s, %s)
+                    on conflict (external_event_id) do nothing
+                    returning id
+                    """,
+                    (external_event_id, channel, thread_id, request_id),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return row is not None
+
+    def get_request_id_by_external_event(self, external_event_id: str) -> str | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select request_id from webhook_event
+                    where external_event_id = %s
+                    """,
+                    (external_event_id,),
+                )
+                row = cur.fetchone()
+        return row["request_id"] if row else None
 
     def insert_evidence(self, request_id: str, tool_name: str, payload: Dict[str, Any]) -> None:
         with self._connect() as conn:
@@ -80,6 +150,9 @@ class PostgresRepository:
         status: str,
         metadata: Dict[str, Any],
     ) -> Dict[str, Any]:
+        if status not in VALID_ACTION_STATUSES:
+            raise ValueError(f"invalid action status: {status}")
+
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -88,6 +161,7 @@ class PostgresRepository:
                     (request_id, action_type, target, idempotency_key, status, metadata_json)
                     values (%s, %s, %s, %s, %s, %s::jsonb)
                     on conflict (idempotency_key) do update
+                    set metadata_json = action_execution_log.metadata_json || excluded.metadata_json
                     set status = excluded.status,
                         metadata_json = action_execution_log.metadata_json || excluded.metadata_json
                     returning *
@@ -120,11 +194,51 @@ class PostgresRepository:
                 row = cur.fetchone()
         return row
 
+    def transition_action_status(self, idempotency_key: str, next_status: str) -> Dict[str, Any] | None:
+        if next_status not in VALID_ACTION_STATUSES:
+            raise ValueError(f"invalid action status: {next_status}")
+
     def transition_action_to_executed(self, idempotency_key: str) -> Dict[str, Any] | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
+                    select * from action_execution_log
+                    where idempotency_key = %s
+                    for update
+                    """,
+                    (idempotency_key,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    conn.commit()
+                    return None
+
+                current_status = row["status"]
+                if next_status == current_status:
+                    conn.commit()
+                    return row
+
+                allowed = ALLOWED_TRANSITIONS.get(current_status, set())
+                if next_status not in allowed:
+                    raise ValueError(f"invalid transition {current_status} -> {next_status}")
+
+                cur.execute(
+                    """
+                    update action_execution_log
+                    set status = %s
+                    where idempotency_key = %s
+                    returning *
+                    """,
+                    (next_status, idempotency_key),
+                )
+                updated = cur.fetchone()
+            conn.commit()
+        return updated
+
+    def transition_action_to_executed(self, idempotency_key: str) -> Dict[str, Any] | None:
+        return self.transition_action_status(idempotency_key, "executed")
+
                     update action_execution_log
                     set status = 'executed'
                     where idempotency_key = %s
