@@ -50,6 +50,12 @@ class PostgresRepository:
                     sql = file.read_text(encoding="utf-8")
                     cur.execute(sql)
                     cur.execute("insert into schema_migration (version) values (%s)", (version,))
+    def init_schema(self) -> None:
+        schema_path = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
+        sql = schema_path.read_text(encoding="utf-8")
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
             conn.commit()
 
     def ensure_session(self, thread_id: str, channel: str) -> int:
@@ -156,6 +162,8 @@ class PostgresRepository:
                     values (%s, %s, %s, %s, %s, %s::jsonb)
                     on conflict (idempotency_key) do update
                     set metadata_json = action_execution_log.metadata_json || excluded.metadata_json
+                    set status = excluded.status,
+                        metadata_json = action_execution_log.metadata_json || excluded.metadata_json
                     returning *
                     """,
                     (
@@ -190,6 +198,7 @@ class PostgresRepository:
         if next_status not in VALID_ACTION_STATUSES:
             raise ValueError(f"invalid action status: {next_status}")
 
+    def transition_action_to_executed(self, idempotency_key: str) -> Dict[str, Any] | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -229,6 +238,28 @@ class PostgresRepository:
 
     def transition_action_to_executed(self, idempotency_key: str) -> Dict[str, Any] | None:
         return self.transition_action_status(idempotency_key, "executed")
+
+                    update action_execution_log
+                    set status = 'executed'
+                    where idempotency_key = %s
+                      and status in ('pending_approval', 'approved')
+                    returning *
+                    """,
+                    (idempotency_key,),
+                )
+                updated = cur.fetchone()
+
+                if updated is None:
+                    cur.execute(
+                        """
+                        select * from action_execution_log
+                        where idempotency_key = %s
+                        """,
+                        (idempotency_key,),
+                    )
+                    updated = cur.fetchone()
+            conn.commit()
+        return updated
 
     def log_feedback(
         self,
