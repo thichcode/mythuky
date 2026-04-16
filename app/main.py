@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Dict
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 
 from app.adapters import LokiAdapter, PrometheusAdapter
 from app.config import ApprovalRequest, IncidentMessage, Settings
@@ -30,6 +31,12 @@ loki = LokiAdapter(
     max_retries=settings.http_max_retries,
     retry_backoff_seconds=settings.http_retry_backoff_seconds,
 )
+
+settings = Settings()
+app = FastAPI(title=settings.app_name)
+repo = PostgresRepository(settings.database_url)
+prom = PrometheusAdapter(settings.prometheus_base_url)
+loki = LokiAdapter(settings.loki_base_url)
 llm_advisor = LLMAdvisor(settings)
 
 
@@ -66,6 +73,9 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
 
     if payload.external_event_id:
         repo.register_webhook_event(payload.external_event_id, payload.channel, payload.thread_id, request_id)
+
+    request_id = str(uuid.uuid4())
+    session_id = repo.ensure_session(payload.thread_id, payload.channel)
 
     logger.info(
         "incident_received",
@@ -130,6 +140,9 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
     action_type = "rollback" if should_rollback else "observe"
     requires_approval = payload.env == "prod" and action_type == "rollback"
 
+    action_type = "rollback" if should_rollback else "observe"
+
+    requires_approval = payload.env == "prod" and action_type == "rollback"
     repo.log_policy_decision(
         request_id=request_id,
         action_type=action_type,
@@ -154,6 +167,7 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
                 "env": payload.env,
                 "llm": llm_info,
             },
+            metadata={"session_id": session_id, "env": payload.env},
         )
         if not requires_approval:
             action = run_action_executor(action)
@@ -178,6 +192,8 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
         },
         "recommendation": recommendation,
         "llm": llm_info,
+        "metrics": {"error_rate": error_rate, "redis_latency_ms_estimate": redis_latency},
+        "recommendation": recommendation,
         "proposed_action": action_type,
         "approval_required": requires_approval,
         "action_status": action["status"] if action else "none",
@@ -187,6 +203,7 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
 @app.on_event("startup")
 def startup() -> None:
     repo.apply_migrations()
+    repo.init_schema()
 
 
 @app.get("/healthz")
@@ -195,16 +212,19 @@ def healthz() -> Dict[str, str]:
 
 
 @app.post("/webhook/teams", dependencies=[Depends(verify_api_key)])
+@app.post("/webhook/teams")
 def teams_webhook(payload: IncidentMessage) -> Dict[str, Any]:
     return process_incident(payload)
 
 
 @app.post("/webhook/telegram", dependencies=[Depends(verify_api_key)])
+@app.post("/webhook/telegram")
 def telegram_webhook(payload: IncidentMessage) -> Dict[str, Any]:
     return process_incident(payload)
 
 
 @app.post("/approvals/{request_id}", dependencies=[Depends(verify_api_key)])
+@app.post("/approvals/{request_id}")
 def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any]:
     action = repo.get_action_by_request(request_id)
     if not action:
@@ -227,6 +247,16 @@ def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any
         action = repo.transition_action_status(action["idempotency_key"], "rejected")
         logger.info("approval_rejected", extra={"request_id": request_id})
         return {"request_id": request_id, "status": action["status"] if action else "rejected"}
+        repo.upsert_action(
+            request_id=action["request_id"],
+            action_type=action["action_type"],
+            target=action["target"],
+            idempotency_key=action["idempotency_key"],
+            status="rejected",
+            metadata={"rationale": payload.rationale or ""},
+        )
+        logger.info("approval_rejected", extra={"request_id": request_id})
+        return {"request_id": request_id, "status": "rejected"}
 
     if decision == "edit":
         merged_meta = dict(action["metadata_json"])
@@ -241,6 +271,10 @@ def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any
         )
 
     repo.transition_action_status(action["idempotency_key"], "approved")
+            status="approved",
+            metadata=merged_meta,
+        )
+
     executed = run_action_executor(action)
     if not executed:
         raise HTTPException(status_code=409, detail="action execution conflict")
@@ -258,6 +292,7 @@ def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any
 
 
 @app.get("/requests/{request_id}", dependencies=[Depends(verify_api_key)])
+@app.get("/requests/{request_id}")
 def get_request(request_id: str) -> Dict[str, Any]:
     action = repo.get_action_by_request(request_id)
     if not action:

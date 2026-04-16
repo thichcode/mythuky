@@ -73,6 +73,7 @@ create table if not exists action_execution_log (
   target text not null,
   idempotency_key text not null,
   status text not null check (status in ('pending_approval', 'approved', 'executed', 'rejected', 'failed')),
+  status text not null,
   metadata_json jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   unique(idempotency_key)
