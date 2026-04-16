@@ -1,0 +1,57 @@
+version: 1
+
+rules:
+  - id: prod_rollback_requires_approval
+    description: Any rollback in production must be approved by an authorized human.
+    when:
+      action_type: rollback
+      environment: prod
+    enforce:
+      requires_approval: true
+      block_auto_execute: true
+
+  - id: redis_error_precheck
+    description: If redis-related errors trend up, require redis health checks before rollback.
+    when:
+      action_type: rollback
+      observed_signals:
+        - redis_latency_high
+        - token_timeout_high
+    enforce:
+      required_prechecks:
+        - redis_saturation
+        - redis_connection_pool
+      block_until_prechecks_pass: true
+
+  - id: canary_first_prod
+    description: Prefer canary rollback before full rollback in production.
+    when:
+      action_type: rollback
+      environment: prod
+    enforce:
+      default_scope: canary
+      escalate_to_full_scope_requires_second_approval: true
+
+  - id: nonprod_fastpath
+    description: Non-production rollback can auto-execute with audit logging.
+    when:
+      action_type: rollback
+      environment: non-prod
+    enforce:
+      requires_approval: false
+      require_audit_log: true
+
+rbac:
+  approver_roles:
+    - sre_oncall
+    - service_owner
+    - incident_commander
+
+audit:
+  required_fields:
+    - request_id
+    - user_id
+    - action_type
+    - environment
+    - evidence_refs
+    - decision_reason
