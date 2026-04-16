@@ -20,6 +20,15 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     openai_base_url: str | None = None
+    ollama_base_url: str = "http://localhost:11434"
+
+    auth_enabled: bool = True
+    api_key: str = "change-me"
+
+    http_max_retries: int = 2
+    http_retry_backoff_seconds: float = 0.3
+
+    log_level: str = "INFO"
 
     ollama_base_url: str = "http://localhost:11434"
 

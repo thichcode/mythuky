@@ -5,12 +5,32 @@ import json
 import uuid
 from typing import Any, Dict
 
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi import FastAPI, HTTPException
 
 from app.adapters import LokiAdapter, PrometheusAdapter
 from app.config import ApprovalRequest, IncidentMessage, Settings
 from app.db import PostgresRepository
 from app.llm import LLMAdvisor, LLMUnavailableError
+from app.logging_utils import configure_logging, get_logger
+from app.security import verify_api_key
+
+settings = Settings()
+configure_logging(settings.log_level)
+logger = get_logger(__name__)
+
+app = FastAPI(title=settings.app_name)
+repo = PostgresRepository(settings.database_url)
+prom = PrometheusAdapter(
+    settings.prometheus_base_url,
+    max_retries=settings.http_max_retries,
+    retry_backoff_seconds=settings.http_retry_backoff_seconds,
+)
+loki = LokiAdapter(
+    settings.loki_base_url,
+    max_retries=settings.http_max_retries,
+    retry_backoff_seconds=settings.http_retry_backoff_seconds,
+)
 
 settings = Settings()
 app = FastAPI(title=settings.app_name)
@@ -33,6 +53,16 @@ def run_action_executor(action_row: Dict[str, Any]) -> Dict[str, Any]:
 def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
     request_id = str(uuid.uuid4())
     session_id = repo.ensure_session(payload.thread_id, payload.channel)
+
+    logger.info(
+        "incident_received",
+        extra={
+            "request_id": request_id,
+            "service": payload.service,
+            "env": payload.env,
+            "thread_id": payload.thread_id,
+        },
+    )
 
     metrics = prom.query_error_rate(payload.service, payload.env)
     logs = loki.query_redis_latency(payload.service)
@@ -79,6 +109,10 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
         recommendation = llm_result.get("recommendation") or recommendation
     except (LLMUnavailableError, json.JSONDecodeError, KeyError, ValueError) as exc:
         llm_info["fallback_reason"] = f"llm_fallback: {exc}"
+        logger.warning(
+            "llm_fallback",
+            extra={"request_id": request_id, "reason": llm_info["fallback_reason"]},
+        )
 
     action_type = "rollback" if should_rollback else "observe"
     requires_approval = payload.env == "prod" and action_type == "rollback"
@@ -115,6 +149,16 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
         if not requires_approval:
             action = run_action_executor(action)
 
+    logger.info(
+        "incident_decided",
+        extra={
+            "request_id": request_id,
+            "service": payload.service,
+            "proposed_action": action_type,
+            "approval_required": requires_approval,
+        },
+    )
+
     return {
         "request_id": request_id,
         "service": payload.service,
@@ -143,16 +187,19 @@ def healthz() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/webhook/teams", dependencies=[Depends(verify_api_key)])
 @app.post("/webhook/teams")
 def teams_webhook(payload: IncidentMessage) -> Dict[str, Any]:
     return process_incident(payload)
 
 
+@app.post("/webhook/telegram", dependencies=[Depends(verify_api_key)])
 @app.post("/webhook/telegram")
 def telegram_webhook(payload: IncidentMessage) -> Dict[str, Any]:
     return process_incident(payload)
 
 
+@app.post("/approvals/{request_id}", dependencies=[Depends(verify_api_key)])
 @app.post("/approvals/{request_id}")
 def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any]:
     action = repo.get_action_by_request(request_id)
@@ -181,6 +228,7 @@ def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any
             status="rejected",
             metadata={"rationale": payload.rationale or ""},
         )
+        logger.info("approval_rejected", extra={"request_id": request_id})
         return {"request_id": request_id, "status": "rejected"}
 
     if decision == "edit":
@@ -199,6 +247,10 @@ def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any
     if not executed:
         raise HTTPException(status_code=409, detail="action execution conflict")
 
+    logger.info(
+        "approval_executed",
+        extra={"request_id": request_id, "status": executed["status"]},
+    )
     return {
         "request_id": request_id,
         "status": executed["status"],
@@ -207,6 +259,7 @@ def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any
     }
 
 
+@app.get("/requests/{request_id}", dependencies=[Depends(verify_api_key)])
 @app.get("/requests/{request_id}")
 def get_request(request_id: str) -> Dict[str, Any]:
     action = repo.get_action_by_request(request_id)

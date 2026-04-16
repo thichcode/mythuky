@@ -1,5 +1,6 @@
 # ChatOps AI Incident Copilot (Production-Ready Starter)
 
+This repository contains a runnable hybrid API service for incident triage + controlled rollback flow:
 
 This repository now contains a runnable hybrid API service for incident triage + controlled rollback flow:
 
@@ -11,12 +12,20 @@ This repository now contains a runnable hybrid API service for incident triage +
 - Approval flow (`approve/edit/reject`) for production rollback
 - Idempotent action execution via deterministic idempotency key
 - LLM fallback to rule-based recommendation if LLM is unavailable/fails
+- Hardening: API key auth, adapter retries, and structured JSON logging
 - Approval flow (`approve/edit/reject`) for production rollback
 - Idempotent action execution via deterministic idempotency key
 
 ## Repository layout
 
 - `app/main.py`: FastAPI service and orchestration entrypoints.
+- `app/adapters.py`: Prometheus/Loki adapters with retry.
+- `app/llm.py`: OpenAI/Ollama LLM advisor client.
+- `app/security.py`: API key verification dependency.
+- `app/logging_utils.py`: JSON structured logging formatter/configuration.
+- `app/db.py`: PostgreSQL repository and persistence logic.
+- `app/config.py`: environment-driven settings and request schemas.
+- `tests/`: pytest tests for utilities/auth/LLM fallback behavior.
 - `app/adapters.py`: Prometheus/Loki adapters.
 - `app/llm.py`: OpenAI/Ollama LLM advisor client.
 - `app/db.py`: PostgreSQL repository and persistence logic.
@@ -42,6 +51,22 @@ pip install -r requirements.txt
 cp .env.example .env
 # edit .env as needed
 uvicorn app.main:app --reload --port 8000
+```
+
+## Security & hardening config
+
+```env
+AUTH_ENABLED=true
+API_KEY=change-me
+HTTP_MAX_RETRIES=2
+HTTP_RETRY_BACKOFF_SECONDS=0.3
+LOG_LEVEL=INFO
+```
+
+Call protected endpoints with:
+
+```bash
+-H 'X-API-Key: change-me'
 ```
 
 ## LLM provider config
@@ -84,6 +109,7 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 curl -s http://localhost:8000/webhook/teams \
   -H 'content-type: application/json' \
+  -H 'X-API-Key: change-me' \
   -d '{
     "user_id":"u1",
     "channel":"teams",
@@ -99,11 +125,18 @@ curl -s http://localhost:8000/webhook/teams \
 ```bash
 curl -s http://localhost:8000/approvals/<request_id> \
   -H 'content-type: application/json' \
+  -H 'X-API-Key: change-me' \
   -d '{
     "approver_id":"oncall-1",
     "decision":"approve",
     "rationale":"error rate keeps increasing"
   }' | jq
+```
+
+## Tests
+
+```bash
+pytest -q
 ```
 
 ## Notes
