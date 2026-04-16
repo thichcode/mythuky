@@ -12,6 +12,17 @@ class Settings(BaseSettings):
     rollback_error_rate_threshold: float = 0.05
     redis_latency_threshold_ms: float = 80.0
 
+    llm_enabled: bool = True
+    llm_provider: str = "openai"  # openai | ollama
+    llm_model: str = "gpt-4.1-mini"
+    llm_timeout_seconds: float = 12.0
+    llm_temperature: float = 0.1
+
+    openai_api_key: str = ""
+    openai_base_url: str | None = None
+
+    ollama_base_url: str = "http://localhost:11434"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

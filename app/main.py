@@ -10,12 +10,14 @@ from fastapi import FastAPI, HTTPException
 from app.adapters import LokiAdapter, PrometheusAdapter
 from app.config import ApprovalRequest, IncidentMessage, Settings
 from app.db import PostgresRepository
+from app.llm import LLMAdvisor, LLMUnavailableError
 
 settings = Settings()
 app = FastAPI(title=settings.app_name)
 repo = PostgresRepository(settings.database_url)
 prom = PrometheusAdapter(settings.prometheus_base_url)
 loki = LokiAdapter(settings.loki_base_url)
+llm_advisor = LLMAdvisor(settings)
 
 
 def build_idempotency_key(request_id: str, action_type: str, target: str) -> str:
@@ -47,6 +49,40 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
     )
 
     recommendation = "check redis + pool before rollback"
+    llm_info: Dict[str, Any] = {"used": False, "fallback_reason": None}
+
+    llm_context = {
+        "request_id": request_id,
+        "service": payload.service,
+        "env": payload.env,
+        "user_text": payload.text,
+        "signals": {
+            "error_rate": error_rate,
+            "redis_latency_ms_estimate": redis_latency,
+            "thresholds": {
+                "rollback_error_rate_threshold": settings.rollback_error_rate_threshold,
+                "redis_latency_threshold_ms": settings.redis_latency_threshold_ms,
+            },
+        },
+        "rule_based_action": "rollback" if should_rollback else "observe",
+    }
+
+    try:
+        llm_result = llm_advisor.suggest(llm_context)
+        llm_info = {
+            "used": True,
+            "provider": llm_result.get("provider"),
+            "model": llm_result.get("model"),
+            "confidence": llm_result.get("confidence"),
+            "fallback_reason": None,
+        }
+        recommendation = llm_result.get("recommendation") or recommendation
+    except (LLMUnavailableError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        llm_info["fallback_reason"] = f"llm_fallback: {exc}"
+
+    action_type = "rollback" if should_rollback else "observe"
+    requires_approval = payload.env == "prod" and action_type == "rollback"
+
     action_type = "rollback" if should_rollback else "observe"
 
     requires_approval = payload.env == "prod" and action_type == "rollback"
@@ -69,6 +105,11 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
             target=payload.service,
             idempotency_key=idempotency_key,
             status=status,
+            metadata={
+                "session_id": session_id,
+                "env": payload.env,
+                "llm": llm_info,
+            },
             metadata={"session_id": session_id, "env": payload.env},
         )
         if not requires_approval:
@@ -78,6 +119,12 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
         "request_id": request_id,
         "service": payload.service,
         "env": payload.env,
+        "metrics": {
+            "error_rate": error_rate,
+            "redis_latency_ms_estimate": redis_latency,
+        },
+        "recommendation": recommendation,
+        "llm": llm_info,
         "metrics": {"error_rate": error_rate, "redis_latency_ms_estimate": redis_latency},
         "recommendation": recommendation,
         "proposed_action": action_type,
