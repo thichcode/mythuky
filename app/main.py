@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Dict
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 
 from app.adapters import LokiAdapter, PrometheusAdapter
 from app.config import ApprovalRequest, IncidentMessage, Settings
@@ -30,6 +31,12 @@ loki = LokiAdapter(
     max_retries=settings.http_max_retries,
     retry_backoff_seconds=settings.http_retry_backoff_seconds,
 )
+
+settings = Settings()
+app = FastAPI(title=settings.app_name)
+repo = PostgresRepository(settings.database_url)
+prom = PrometheusAdapter(settings.prometheus_base_url)
+loki = LokiAdapter(settings.loki_base_url)
 llm_advisor = LLMAdvisor(settings)
 
 
@@ -110,6 +117,9 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
     action_type = "rollback" if should_rollback else "observe"
     requires_approval = payload.env == "prod" and action_type == "rollback"
 
+    action_type = "rollback" if should_rollback else "observe"
+
+    requires_approval = payload.env == "prod" and action_type == "rollback"
     repo.log_policy_decision(
         request_id=request_id,
         action_type=action_type,
@@ -134,6 +144,7 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
                 "env": payload.env,
                 "llm": llm_info,
             },
+            metadata={"session_id": session_id, "env": payload.env},
         )
         if not requires_approval:
             action = run_action_executor(action)
@@ -158,6 +169,8 @@ def process_incident(payload: IncidentMessage) -> Dict[str, Any]:
         },
         "recommendation": recommendation,
         "llm": llm_info,
+        "metrics": {"error_rate": error_rate, "redis_latency_ms_estimate": redis_latency},
+        "recommendation": recommendation,
         "proposed_action": action_type,
         "approval_required": requires_approval,
         "action_status": action["status"] if action else "none",
@@ -175,16 +188,19 @@ def healthz() -> Dict[str, str]:
 
 
 @app.post("/webhook/teams", dependencies=[Depends(verify_api_key)])
+@app.post("/webhook/teams")
 def teams_webhook(payload: IncidentMessage) -> Dict[str, Any]:
     return process_incident(payload)
 
 
 @app.post("/webhook/telegram", dependencies=[Depends(verify_api_key)])
+@app.post("/webhook/telegram")
 def telegram_webhook(payload: IncidentMessage) -> Dict[str, Any]:
     return process_incident(payload)
 
 
 @app.post("/approvals/{request_id}", dependencies=[Depends(verify_api_key)])
+@app.post("/approvals/{request_id}")
 def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any]:
     action = repo.get_action_by_request(request_id)
     if not action:
@@ -244,6 +260,7 @@ def approval_webhook(request_id: str, payload: ApprovalRequest) -> Dict[str, Any
 
 
 @app.get("/requests/{request_id}", dependencies=[Depends(verify_api_key)])
+@app.get("/requests/{request_id}")
 def get_request(request_id: str) -> Dict[str, Any]:
     action = repo.get_action_by_request(request_id)
     if not action:
