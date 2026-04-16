@@ -26,6 +26,8 @@ This repository now contains a runnable hybrid API service for incident triage +
 - `app/db.py`: PostgreSQL repository and persistence logic.
 - `app/config.py`: environment-driven settings and request schemas.
 - `tests/`: pytest tests for utilities/auth/LLM fallback behavior.
+- `.env.example`: configuration template.
+- `docs/bridge-contract.md`: Teams ingress + Telegram approval JSON contracts and identity mapping guidance.
 - `app/adapters.py`: Prometheus/Loki adapters.
 - `app/llm.py`: OpenAI/Ollama LLM advisor client.
 - `app/db.py`: PostgreSQL repository and persistence logic.
@@ -147,6 +149,10 @@ Integration-like API tests are in `tests/test_api_integration.py` (webhook -> ap
 
 ## Notes
 
+- Identity links can be stored in `user_identity_map` for Teams/Telegram/internal user correlation.
+- In `prod`, rollback is persisted as `pending_approval` first.
+- Execution is idempotent by `idempotency_key` (`sha256(request_id:action:target)`).
+- If LLM fails (provider unavailable, bad response, missing key), service falls back to rule-based recommendation and still returns incident output.
 - In `prod`, rollback is persisted as `pending_approval` first.
 - Execution is idempotent by `idempotency_key` (`sha256(request_id:action:target)`).
 - If LLM fails (provider unavailable, bad response, missing key), service falls back to rule-based recommendation and still returns incident output.
